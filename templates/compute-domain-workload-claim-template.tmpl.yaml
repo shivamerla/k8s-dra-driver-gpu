@@ -16,6 +16,11 @@ spec:
       - name: channel
         exactly:
           deviceClassName: {{ .DeviceClassName }}
+{{- if .Selector }}
+          selectors:
+          - cel:
+              expression: '{{ .Selector }}'
+{{- end }}
       config:
       - requests: ["channel"]
         opaque:
@@ -25,3 +30,6 @@ spec:
             kind: {{ .ChannelConfig.Kind }}
             domainID: {{ .ChannelConfig.DomainID }}
             allocationMode: {{ .ChannelConfig.AllocationMode }}
+{{- if .ChannelConfig.ResourceClaimTemplateName }}
+            resourceClaimTemplateName: {{ .ChannelConfig.ResourceClaimTemplateName }}
+{{- end }}
