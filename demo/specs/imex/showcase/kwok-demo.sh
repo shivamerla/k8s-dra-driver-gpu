@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Usage: kwok-demo.sh setup|run|day0|workloads|upgrade|board|reset|teardown
+# Usage: kwok-demo.sh setup|run|tmux|day0|workloads|upgrade|board|reset|teardown
 #
 # The backup demo: static IMEX daemons on 8 fake GB200 NVL72 racks (18 KWOK
 # nodes each) in a kind cluster, drawn as one row of 18 nodes per rack.
@@ -21,11 +21,14 @@
 #   setup      creates the cluster with tests/scale, installs the driver with
 #              static daemons, and starts the agent that simulates them
 #   run        day0, workloads and upgrade, waiting for Enter between steps
+#   tmux       run in a split screen with the last applied YAML, the racks and
+#              the driver pods always in view (see panes.sh)
 #   day0       the admin creates the ComputeDomainDaemonSet: 144 daemons
 #   workloads  two ComputeDomains start on racks that already run daemons
-#   upgrade    a new daemon image rolls out two racks at a time, one block
-#              of racks after the other, pauses, stalls on a broken node,
-#              and finishes once the admin cordons it
+#   upgrade    the workloads are drained, as restarting the daemons of a
+#              rack disrupts its jobs; then a new daemon image rolls out two
+#              racks at a time, one domain of racks after the other, pauses,
+#              stalls on a broken node, and finishes once the admin cordons it
 #   reset      removes the workloads and daemons, to run again
 #   teardown   stops the agent; add --cluster to delete the cluster
 
@@ -34,9 +37,15 @@ set -euo pipefail
 DEMO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../../../../tests/scale/scripts/common.sh
 source "${DEMO_DIR}/../../../../tests/scale/scripts/common.sh"
+# The rack board and the objects need more rows than the panes default to.
+: "${DEMO_BOARD_ROWS:=24}"
+# shellcheck source=panes.sh
+source "${DEMO_DIR}/panes.sh"
 
 : "${DEMO_NS:=kwok-demo}"
 : "${DEMO_AUTO:=0}"
+# Seconds each step stays on screen with DEMO_AUTO=1.
+: "${DEMO_HOLD:=15}"
 : "${DEMO_RACKS:=8}"
 : "${DEMO_TIMEOUT:=300}"
 # The node whose new daemon never becomes ready in the upgrade.
@@ -45,28 +54,48 @@ source "${DEMO_DIR}/../../../../tests/scale/scripts/common.sh"
 
 RACK_SIZE=18
 UUID="5ca1ab1e-0000-4000-8000-00000000c11c"
-BLOCK_KEY="demo.nvidia.com/block"
+DOMAIN_KEY="demo.nvidia.com/domain"
 HASH_KEY="resource.nvidia.com/templateHash"
 AGENT_PID="${SCALE_STATE_DIR}/kwok-demo-agent.pid"
 AGENT_LOG="${SCALE_STATE_DIR}/kwok-demo-agent.log"
 
 R=$'\e[0m' B=$'\e[1m' D=$'\e[2m' GRN=$'\e[32m' YLW=$'\e[33m' CYN=$'\e[36m' MAG=$'\e[35m' RED=$'\e[31m'
 
-step() { printf '\n%s▸ %s%s\n' "${B}${CYN}" "$*" "${R}"; }
+STEP_TITLE=""
+step() {
+  STEP_TITLE="$*"
+  printf '\n%s▸ %s%s\n' "${B}${CYN}" "$*" "${R}"
+}
 note() { printf '  %s%s%s\n' "${D}" "$*" "${R}"; }
 ok() { printf '  %s✔ %s%s\n' "${GRN}" "$*" "${R}"; }
 fail() { printf '  %s✘ %s%s\n' "${RED}" "$*" "${R}" >&2; exit 1; }
 
+# pause waits for Enter, or with DEMO_AUTO=1 holds the screen for DEMO_HOLD
+# seconds, so that the audience can read it.
 pause() {
-  [[ "${DEMO_AUTO}" == 1 ]] && return 0
+  if [[ "${DEMO_AUTO}" == 1 ]]; then
+    sleep "${DEMO_HOLD}"
+    return 0
+  fi
   printf '%s  ⏎%s' "${D}" "${R}"
   read -rs _
   printf '\r    \r'
 }
 
+# run prints a command, then runs it. Commands that change the cluster also
+# go to the applied pane.
 run() {
   printf '%s$ %s%s\n' "${YLW}" "$*" "${R}"
+  case "$2" in
+    get | wait) ;;
+    *) record "${STEP_TITLE}" "\$ $*" ;;
+  esac
   eval "$@"
+}
+
+# show_board draws the board, unless a pane of its own does.
+show_board() {
+  panes_on || board
 }
 
 banner() {
@@ -78,7 +107,8 @@ banner() {
 show_apply() {
   local manifest
   manifest=$(cat)
-  printf '%s%s%s\n' "${D}" "$(sed 's/^/    /' <<< "${manifest}")" "${R}"
+  record "${STEP_TITLE}" "${manifest}"
+  panes_on || printf '%s%s%s\n' "${D}" "$(sed 's/^/    /' <<< "${manifest}")" "${R}"
   kubectl apply -f - <<< "${manifest}" > /dev/null
 }
 
@@ -105,25 +135,26 @@ board() {
     | (($cdds.status.cliques // []) | map({key: .id, value: .}) | from_entries) as $cs
     | ($cdds.status.updatingTopology // "") as $updating
     | [$nodes.items[] | {name: .metadata.name, clique: .metadata.labels["nvidia.com/gpu.clique"],
-         block: (.metadata.labels["'"${BLOCK_KEY}"'"] // "-"), cordoned: (.spec.unschedulable // false)}]
+         domain: (.metadata.labels["'"${DOMAIN_KEY}"'"] // "-"), cordoned: (.spec.unschedulable // false)}]
     | group_by(.clique) | sort_by(.[0].name)[]
     | . as $rack | ($cs[$rack[0].clique] // {}) as $st | (($st.stalledReason // "") != "") as $stalled
     | [$rack | sort_by(.name)[] | . as $n
         | ([$dp[$n.name][]? | select(.metadata.deletionTimestamp == null and ready)]) as $up
         | (if ($up | length) == 0 then (if ($dp[$n.name] // [] | length) == 0 then "none" else "wait" end)
            elif any($up[]; .metadata.annotations["'"${HASH_KEY}"'"] == $hash) then "new" else "old" end) as $s
-        | (if $n.cordoned then "100;37" elif $s == "new" then "42;30" elif $s == "old" then "44;97"
-           elif $s == "wait" and $stalled then "41;97" elif $s == "wait" then "43;30" else "100;37" end) as $c
-        | ({"llm": "◆", "chat": "●"}[$wl[$n.name] // ""] // (if $n.cordoned then "░" else " " end)) as $g
+        | (if $n.cordoned then "38;5;244;48;5;236" elif $s == "new" then "38;5;255;48;5;29"
+           elif $s == "old" then "38;5;255;48;5;24" elif $s == "wait" and $stalled then "38;5;255;48;5;124"
+           elif $s == "wait" then "38;5;232;48;5;179" else "38;5;255;48;5;245" end) as $c
+        | ({"vision": "◆", "speech": "●"}[$wl[$n.name] // ""] // (if $n.cordoned then "░" else " " end)) as $g
         | esc($c) + " " + $g + " " + esc("0")] as $cells
     | (if $stalled then esc("1;31") + "  STALLED" + esc("0")
        elif ($st.updatedNodes // 0) == ($st.nodes // -1) and ($st.readyNodes // 0) == ($st.nodes // -1) then esc("32") + "  ✔ \($st.updatedNodes)/\($st.nodes)" + esc("0")
-       elif $updating != "" and $rack[0].block == $updating then esc("33") + "  ◀ updating \($st.updatedNodes // 0)/\($st.nodes // 0)" + esc("0")
+       elif $updating != "" and $rack[0].domain == $updating then esc("33") + "  ◀ updating \($st.updatedNodes // 0)/\($st.nodes // 0)" + esc("0")
        else esc("2") + "  \($st.updatedNodes // 0)/\($st.nodes // 0)" + esc("0") end) as $tail
-    | "  " + esc("1") + "rack \($rack[0].clique | split(".") | last)" + esc("0") + esc("2") + "  block \($rack[0].block)  " + esc("0")
+    | "  " + esc("1") + "rack \($rack[0].clique | split(".") | last)" + esc("0") + esc("2") + "  domain \($rack[0].domain)  " + esc("0")
       + ($cells | join("")) + $tail'
-  printf '\n  %s   %s new daemon  %s   %s old daemon  %s   %s restarting  %s   %s stalled  %s ░ %s cordoned   ◆ llm  ● chat\n' \
-    $'\e[42m' "${R}" $'\e[44m' "${R}" $'\e[43m' "${R}" $'\e[41m' "${R}" $'\e[100m' "${R}"
+  printf '\n  %s   %s new daemon  %s   %s old daemon  %s   %s restarting  %s   %s stalled  %s ░ %s cordoned   ◆ vision  ● speech\n' \
+    $'\e[48;5;29m' "${R}" $'\e[48;5;24m' "${R}" $'\e[48;5;179m' "${R}" $'\e[48;5;124m' "${R}" $'\e[48;5;236m' "${R}"
   jq -r '.status.conditions[]? | select(.type == "RolloutInProgress" and .status == "True")
     | "\n  \u001b[1m\(.reason)\u001b[0m  \(.message | .[0:220])"' <<< "${cdds}"
 }
@@ -133,11 +164,18 @@ board() {
 watch_board() {
   local title="$1" until="$2" deadline=$((SECONDS + DEMO_TIMEOUT)) started=$SECONDS
   while ((SECONDS < deadline)); do
-    printf '\e[2J\e[H'
-    banner "${title}" "$((SECONDS - started))s"
-    kubectl get computedomaindaemonset 2> /dev/null | sed 's/^/  /' || true
-    board
-    eval "${until}" && return 0
+    if panes_on; then
+      printf '\r  %s%s, %ds%s ' "${D}" "${title}" "$((SECONDS - started))" "${R}"
+    else
+      printf '\e[2J\e[H'
+      banner "${title}" "$((SECONDS - started))s"
+      kubectl get computedomaindaemonset 2> /dev/null | sed 's/^/  /' || true
+      board
+    fi
+    if eval "${until}"; then
+      panes_on && printf '\n'
+      return 0
+    fi
     sleep 2
   done
   return 1
@@ -161,7 +199,7 @@ cdds_stalled() {
   kubectl get computedomaindaemonset default -o json | jq -e '[.status.cliques[]? | select(.stalledReason)] | length > 0' > /dev/null
 }
 
-cdds_updating_block() {
+cdds_updating_domain() {
   kubectl get computedomaindaemonset default -o json | jq -e --arg b "$1" '.status.updatingTopology == $b' > /dev/null
 }
 
@@ -211,7 +249,7 @@ setup() {
   "${SCALEBENCH}" nodes up --cliques "${DEMO_RACKS}" --clique-size "${RACK_SIZE}"
   local c
   for ((c = 0; c < DEMO_RACKS; c++)); do
-    kubectl label nodes -l "nvidia.com/gpu.clique=${UUID}.${c}" "${BLOCK_KEY}=$((c < DEMO_RACKS / 2 ? 1 : 2))" --overwrite > /dev/null
+    kubectl label nodes -l "nvidia.com/gpu.clique=${UUID}.${c}" "${DOMAIN_KEY}=$((c < DEMO_RACKS / 2 ? 1 : 2))" --overwrite > /dev/null
   done
   "${SCALE_DIR}/scripts/install-driver.sh" static
   reset
@@ -228,11 +266,11 @@ reset() {
 }
 
 day0() {
-  banner "1 · Day 0: the admin creates the daemons" "${DEMO_RACKS} racks × ${RACK_SIZE} GB200 nodes, nothing runs yet"
+  banner "1 · Day 0" "${DEMO_RACKS} racks of ${RACK_SIZE} GB200 nodes, no daemons yet"
   agent_running || start_agent
-  board
+  show_board
   pause
-  step "One ComputeDomainDaemonSet for the whole cluster, before any workload"
+  step "The admin creates the daemons for the whole cluster"
   show_apply << EOF
 apiVersion: resource.nvidia.com/v1beta1
 kind: ComputeDomainDaemonSet
@@ -245,11 +283,11 @@ spec:
       maxUnavailableCliques: 2        # two racks at a time
       minReadySeconds: 5              # soak each batch
       progressDeadlineSeconds: 20     # report a rack that does not come back
-      topologyKey: ${BLOCK_KEY}  # block 1 first, then block 2
+      topologyKey: ${DOMAIN_KEY}  # domain 1 first, then domain 2
 EOF
   pause
-  watch_board "1 · Day 0: daemons start on every rack" cdds_done || fail "the daemons did not become ready"
-  ok "$((DEMO_RACKS * RACK_SIZE)) IMEX daemons ready, before the first workload"
+  watch_board "1 · Day 0: daemons starting" cdds_done || fail "the daemons did not become ready"
+  ok "$((DEMO_RACKS * RACK_SIZE)) daemons ready before the first job"
   pause
 }
 
@@ -304,51 +342,55 @@ workloads_running() {
 }
 
 workloads() {
-  banner "2 · Workloads" "Jobs start on racks whose daemons already run"
+  banner "2 · Jobs" "No daemon to wait for"
   kubectl create namespace "${DEMO_NS}" --dry-run=client -o yaml | kubectl apply -f - > /dev/null
-  step "llm: 36 pods × 4 GPUs on racks 1 and 2 · chat: 8 pods × 2 GPUs, two per node on rack 5"
+  step "vision on racks 1 and 2, speech two pods per node on rack 5"
   {
-    workload llm 36 4 nvidia.com/gpu.clique "${UUID}.1, ${UUID}.2"
-    workload chat 8 2 kubernetes.io/hostname "kwok-c0005-n00, kwok-c0005-n01, kwok-c0005-n02, kwok-c0005-n03"
+    workload vision 36 4 nvidia.com/gpu.clique "${UUID}.1, ${UUID}.2"
+    workload speech 8 2 kubernetes.io/hostname "kwok-c0005-n00, kwok-c0005-n01, kwok-c0005-n02, kwok-c0005-n03"
   } | kubectl apply -f - > /dev/null
-  watch_board "2 · Workloads start, no daemon to wait for" workloads_running || fail "the workloads did not start"
-  ok "44 pods running, every one got its IMEX channel from a daemon already up"
+  watch_board "2 · Jobs starting" workloads_running || fail "the workloads did not start"
+  ok "44 pods running, channels ready at once"
   pause
 }
 
 upgrade() {
-  banner "3 · Upgrade the daemons" "The admin decides when and how fast; workloads keep running"
-  step "A node in rack 6 cannot start the new daemon (simulated)"
+  banner "3 · Daemon upgrades" "Rack by rack, when the admin decides"
+  # Restarting the IMEX daemons of a clique breaks the multi-node jobs on it,
+  # so admins move workloads off before the daemons change.
+  step "Drain jobs first: a daemon restart disrupts its rack"
+  run kubectl delete pods -n "${DEMO_NS}" --all
+  ok "Racks drained"
+  pause
+  step "Simulate a node in rack 6 that cannot start the new daemon"
   break_node "${DEMO_BROKEN_NODE}"
-  note "${DEMO_BROKEN_NODE}: KWOK will not make new pods ready there"
-  step "New daemon image, rolled out by the strategy set on day 0"
+  step "Roll out a new daemon image"
   run kubectl patch computedomaindaemonset default --type=merge -p "'{\"spec\": {\"image\": \"${DEMO_NEW_IMAGE}\"}}'"
   pause
 
-  watch_board "3 · Rolling out block 1, two racks at a time" "cdds_updating_block 2" ||
-    fail "the rollout did not reach block 2"
-  step "Pause before block 2, for example to check the first racks"
+  watch_board "3 · Domain 1, two racks at a time" "cdds_updating_domain 2" ||
+    fail "the rollout did not reach domain 2"
+  step "Pause before domain 2"
   run kubectl patch computedomaindaemonset default --type=merge -p "'{\"spec\": {\"updateStrategy\": {\"rollingUpdate\": {\"paused\": true}}}}'"
   sleep 3
-  printf '\e[2J\e[H'
-  banner "3 · Paused" "batches in progress finish, no new ones start"
-  board
+  if ! panes_on; then
+    printf '\e[2J\e[H'
+    banner "3 · Paused" "Racks in progress finish, no new ones start"
+    board
+  fi
   pause
   run kubectl patch computedomaindaemonset default --type=merge -p "'{\"spec\": {\"updateStrategy\": {\"rollingUpdate\": {\"paused\": false}}}}'"
 
-  watch_board "3 · Rolling out block 2" "cdds_stalled || cdds_rolled" || fail "the rollout did not finish"
+  watch_board "3 · Domain 2" "cdds_stalled || cdds_rolled" || fail "the rollout did not finish"
   if cdds_stalled; then
     printf '\n'
-    ok "rack 6 is reported stalled and the rollout waits, so a bad revision cannot spread"
+    ok "Rack 6 stalled, and the rollout holds"
     pause
-    step "The admin takes the broken node out of service"
+    step "The admin cordons the broken node"
     run kubectl cordon "${DEMO_BROKEN_NODE}"
-    watch_board "3 · Rollout continues past the cordoned node" cdds_rolled || fail "the rollout did not finish"
+    watch_board "3 · Rollout resumes" cdds_rolled || fail "the rollout did not finish"
   fi
-  ok "every rack runs the new daemons"
-  if kubectl get pods -n "${DEMO_NS}" -o json 2> /dev/null | jq -e '.items | length > 0 and all(.status.phase == "Running")' > /dev/null; then
-    ok "and all workload pods kept running"
-  fi
+  ok "All racks updated"
   pause
 }
 
@@ -361,11 +403,37 @@ teardown() {
   ok "agent stopped"
 }
 
+# driver_pods lists the driver pods, then the IMEX daemon pods, newest first
+# so that the ones a rollout replaces are on top.
+driver_pods() {
+  kubectl get daemonsets,deployments -n "${DRIVER_NAMESPACE}"
+  printf '\n'
+  kubectl get pods -n "${DRIVER_NAMESPACE}" -l '!resource.nvidia.com/computeDomainDaemonSet' -o wide
+  printf '\n'
+  kubectl get pods -n "${DRIVER_NAMESPACE}" -l resource.nvidia.com/computeDomainDaemonSet -o wide \
+    --sort-by=.metadata.creationTimestamp | awk 'NR == 1 {print; next} {l[n++] = $0} END {while (n) print l[--n]}'
+}
+
+# objects prints the ComputeDomain objects, and the pods of each workload.
+objects() {
+  show_objects "${DRIVER_NAMESPACE}" "${DEMO_NS}"
+  printf '\n\e[1;35mPods\e[0m\n'
+  kubectl get pods -n "${DEMO_NS}" -o json 2> /dev/null | jq -r '
+    ["COMPUTEDOMAIN", "PODS", "RUNNING"], (.items | group_by(.metadata.labels.cd)[]
+      | [.[0].metadata.labels.cd, length, ([.[] | select(.status.phase == "Running")] | length)]) | @tsv' |
+    column -t -s $'\t'
+}
+
 main() {
   need() { command -v "$1" > /dev/null || fail "$1 is required"; }
   need kubectl
   need jq
   case "${1:-}" in
+    tmux) panes_tmux "$0" run ;;
+    pane-applied) follow_applied ;;
+    pane-board) refresh board ;;
+    pane-objects) refresh objects ;;
+    pane-pods) refresh driver_pods ;;
     setup) setup ;;
     run)
       agent_running || start_agent
@@ -379,7 +447,7 @@ main() {
     board) board ;;
     reset) reset ;;
     teardown) teardown "${2:-}" ;;
-    *) sed -n '16,31p' "$0"; exit 1 ;;
+    *) sed -n '16,35p' "$0"; exit 1 ;;
   esac
 }
 

@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Usage: demo.sh [all|static|channels|health|upgrade|board|cleanup]
+# Usage: demo.sh [all|tmux|static|channels|health|upgrade|board|cleanup]
 #
 # A three minute walk through static IMEX daemons and ComputeDomain channel
 # reservations on two GB200 nodes of one NVLink clique:
@@ -21,7 +21,10 @@
 #   static    IMEX daemons run on every node before any workload
 #   channels  two ComputeDomains share a node, each template gets its channel
 #   health    a tainted GPU evicts one pod, which moves to the other node
-#   upgrade   the daemons roll out by clique while workloads keep running
+#   upgrade   the workloads are drained, then the daemons roll out by clique
+#
+# "tmux" runs all scenes in a split screen: commands, the last applied YAML,
+# the board of GPUs and channels, and the driver pods (see panes.sh).
 #
 # The driver must run with imex.daemonLifecycle=static, the
 # ComputeDomainDaemonSet and ComputeDomainChannelReservations feature gates,
@@ -37,6 +40,8 @@ set -euo pipefail
 : "${DEMO_NODES:=}"
 # Set to 1 to run without waiting for Enter between steps.
 : "${DEMO_AUTO:=0}"
+# Seconds each step stays on screen with DEMO_AUTO=1.
+: "${DEMO_HOLD:=15}"
 # Set to 1 to recreate the ComputeDomainDaemonSet in the static scene.
 : "${DEMO_FRESH_DAEMONS:=0}"
 # How long the upgrade scene watches the rollout.
@@ -45,38 +50,63 @@ set -euo pipefail
 
 DEMO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CDDS_SPEC="${DEMO_DIR}/../computedomaindaemonset.yaml"
+# shellcheck source=panes.sh
+source "${DEMO_DIR}/panes.sh"
 DAEMON_SELECTOR="resource.nvidia.com/computeDomainDaemonSet"
 
 R=$'\e[0m' B=$'\e[1m' D=$'\e[2m'
 RED=$'\e[31m' GRN=$'\e[32m' YLW=$'\e[33m' BLU=$'\e[34m' MAG=$'\e[35m' CYN=$'\e[36m'
-# Cell colors of the board, per ComputeDomain.
-ALPHA_BG=$'\e[1;97;44m' BETA_BG=$'\e[1;97;45m' FREE_BG=$'\e[2;37;100m' TAINT_BG=$'\e[1;97;41m'
+# Cell colors of the board: one hue per ComputeDomain, one shade per channel.
+VISION_TRAIN_BG=$'\e[38;5;255;48;5;24m' VISION_SERVE_BG=$'\e[38;5;255;48;5;67m'
+SPEECH_BG=$'\e[38;5;255;48;5;95m' FREE_BG=$'\e[38;5;255;48;5;245m' TAINT_BG=$'\e[38;5;255;48;5;124m'
 
 say() { printf '%s\n' "$*"; }
-step() { printf '\n%s▸ %s%s\n' "${B}${CYN}" "$*" "${R}"; }
+STEP_TITLE=""
+step() {
+  STEP_TITLE="$*"
+  printf '\n%s▸ %s%s\n' "${B}${CYN}" "$*" "${R}"
+}
 note() { printf '  %s%s%s\n' "${D}" "$*" "${R}"; }
 ok() { printf '  %s✔ %s%s\n' "${GRN}" "$*" "${R}"; }
 fail() { printf '  %s✘ %s%s\n' "${RED}" "$*" "${R}" >&2; exit 1; }
 
+# pause waits for Enter, or with DEMO_AUTO=1 holds the screen for DEMO_HOLD
+# seconds, so that the audience can read it.
 pause() {
-  [[ "${DEMO_AUTO}" == 1 ]] && return 0
+  if [[ "${DEMO_AUTO}" == 1 ]]; then
+    sleep "${DEMO_HOLD}"
+    return 0
+  fi
   printf '%s  ⏎%s' "${D}" "${R}"
   read -rs _
   printf '\r    \r'
 }
 
-# show_apply prints the manifest on stdin, then applies it.
+# show_apply prints the manifest on stdin, then applies it. With --pause, it
+# holds the manifest on screen before applying it.
 show_apply() {
   local manifest
   manifest=$(cat)
-  printf '%s%s%s\n' "${D}" "$(sed 's/^/    /' <<< "${manifest}")" "${R}"
+  record "${STEP_TITLE}" "${manifest}"
+  panes_on || printf '%s%s%s\n' "${D}" "$(sed 's/^/    /' <<< "${manifest}")" "${R}"
+  [[ "${1:-}" == --pause ]] && pause
   kubectl apply -f - <<< "${manifest}" > /dev/null
 }
 
-# run prints a command, then runs it.
+# run prints a command, then runs it. Commands that change the cluster also
+# go to the applied pane.
 run() {
   printf '%s$ %s%s\n' "${YLW}" "$*" "${R}"
+  case "$2" in
+    get | wait | exec) ;;
+    *) record "${STEP_TITLE}" "\$ $*" ;;
+  esac
   eval "$@"
+}
+
+# show_board draws the board, unless a pane of its own does.
+show_board() {
+  panes_on || board
 }
 
 banner() {
@@ -126,7 +156,7 @@ board() {
   daemons=$(kubectl get pods -n "${DEMO_DRIVER_NS}" -l "${DAEMON_SELECTOR}" -o json)
   rules=$(taint_rules_json)
 
-  local node
+  local node channels=""
   for node in "${NODE1}" "${NODE2}"; do
     local daemon
     daemon=$(jq -r --arg n "${node}" '[.items[] | select(.spec.nodeName == $n and .metadata.deletionTimestamp == null)][0]
@@ -165,22 +195,49 @@ board() {
       t1="${gpu}" t2="" t3="" t4=""
       if [[ "${cd}" == - ]]; then
         bg="${FREE_BG}" t2="free"
-        [[ "${tainted}" == x ]] && bg="${TAINT_BG}" t1="${gpu}  XID 79" t2="unhealthy"
+        [[ "${tainted}" == x ]] && bg="${TAINT_BG}" t1="${gpu}  XID 79" t2="failed"
       else
-        bg="${ALPHA_BG}"
-        [[ "${cd}" == beta ]] && bg="${BETA_BG}"
+        case "${cd}/${tmpl}" in
+          vision/train) bg="${VISION_TRAIN_BG}" ;;
+          vision/serve) bg="${VISION_SERVE_BG}" ;;
+          *) bg="${SPEECH_BG}" ;;
+        esac
         [[ "${tainted}" == x ]] && bg="${TAINT_BG}" t1="${gpu}  XID 79"
+        # printf pads bytes, so cells keep to ASCII.
         t2="${cd} / ${tmpl}" t3="channel ${ch}" t4="${pod}"
+        channels+="${cd} / ${tmpl}"$'\t'"${ch}"$'\t'"${node}"$'\n'
       fi
       o1+=$(printf '%s %-17.17s %s ' "${bg}" "${t1}" "${R}")
       o2+=$(printf '%s %-17.17s %s ' "${bg}" "${t2}" "${R}")
-      o3+=$(printf '%s %-17.17s %s ' "${bg}" "${t3}" "${R}")
+      o3+=$(printf '%s%s %-17.17s %s ' "${bg}" $'\e[1;38;5;229m' "${t3}" "${R}")
       o4+=$(printf '%s %-17.17s %s ' "${bg}" "${t4}" "${R}")
     done <<< "${rows}"
     printf '%s\n%s\n%s\n%s\n' "${o1}" "${o2}" "${o3}" "${o4}"
   done
-  printf '  %s alpha %s %s beta %s %s free %s %s tainted %s   %spods of one template share its channel; templates never do%s\n' \
-    "${ALPHA_BG}" "${R}" "${BETA_BG}" "${R}" "${FREE_BG}" "${R}" "${TAINT_BG}" "${R}" "${D}" "${R}"
+  # One line per channel: the template that owns it and where it runs.
+  if [[ -n "${channels}" ]]; then
+    printf '\n  %sIMEX channels%s\n' "${B}" "${R}"
+    sort -u <<< "${channels}" | sort -t $'\t' -k2,2n | awk -F '\t' 'NF == 3 {k = $1 "\t" $2; if (!(k in n)) o[++c] = k; n[k] = n[k] (n[k] ? ", " : "") $3}
+      END {for (i = 1; i <= c; i++) {split(o[i], f, "\t"); printf "  \033[1m◉ channel %-4s\033[0m %-16s on %s\n", f[2], f[1], n[o[i]]}}'
+    printf '\n'
+  fi
+  printf '  %s vision / train %s %s vision / serve %s %s speech / train %s %s free %s %s failed %s\n' \
+    "${VISION_TRAIN_BG}" "${R}" "${VISION_SERVE_BG}" "${R}" "${SPEECH_BG}" "${R}" "${FREE_BG}" "${R}" "${TAINT_BG}" "${R}"
+}
+
+# objects prints the ComputeDomain objects and the demo pods, with their
+# GPU taints.
+objects() {
+  show_objects "${DEMO_DRIVER_NS}" "${DEMO_NS}"
+  local rules
+  rules=$(kubectl get devicetaintrules -l demo=imex -o json 2> /dev/null | jq -r '.items[]
+    | [.metadata.name, "\(.spec.deviceSelector.pool)/\(.spec.deviceSelector.device)", .spec.taint.effect] | @tsv' 2> /dev/null || true)
+  if [[ -n "${rules}" ]]; then
+    printf '\n\e[1;35mDeviceTaintRules\e[0m\n'
+    printf 'NAME\tDEVICE\tEFFECT\n%s\n' "${rules}" | column -t -s $'\t'
+  fi
+  printf '\n\e[1;35mPods\e[0m\n'
+  kubectl get pods -n "${DEMO_NS}" -o custom-columns='NAME:.metadata.labels.app,STATUS:.status.phase,NODE:.spec.nodeName' 2> /dev/null || true
 }
 
 # ---------------------------------------------------------------- workloads
@@ -254,67 +311,67 @@ wait_available() {
 # ---------------------------------------------------------------- scenes
 
 scene_static() {
-  banner "1 · Static IMEX daemons" "One IMEX daemon per node, shared by every ComputeDomain, up before any workload"
+  banner "1 · Static IMEX daemons" "Ready on every node before any job"
   if [[ "${DEMO_FRESH_DAEMONS}" == 1 ]]; then
-    step "The cluster admin creates the ComputeDomainDaemonSet once"
+    step "The admin creates the daemons once"
     kubectl delete computedomaindaemonset default --ignore-not-found --wait=true > /dev/null
     run kubectl apply -f "${CDDS_SPEC}"
     run kubectl wait computedomaindaemonset default --for=condition=Ready --timeout=600s
   fi
-  step "No workloads yet, but every node of the clique already runs its IMEX daemon"
+  step "No jobs yet, and every node already runs its daemon"
   run kubectl get computedomaindaemonset
-  board
-  ok "a workload never waits for an IMEX daemon to start"
+  show_board
+  ok "Jobs never wait for a daemon"
   pause
 }
 
 scene_channels() {
-  banner "2 · Channel reservations" "Several ComputeDomains on one node, every channel template isolated"
+  banner "2 · Channel reservations" "Many jobs per node, each on its own channel"
   kubectl create namespace "${DEMO_NS}" --dry-run=client -o yaml | kubectl apply -f - > /dev/null
   gpu_templates | kubectl apply -f - > /dev/null
 
-  step "Two ComputeDomains: alpha with two channel templates, beta with one"
+  step "Two ComputeDomains: vision (train and serve) and speech (train)"
   show_apply << EOF
 apiVersion: resource.nvidia.com/v1beta1
 kind: ComputeDomain
-metadata: {name: alpha, namespace: ${DEMO_NS}}
+metadata: {name: vision, namespace: ${DEMO_NS}}
 spec:
   channels:
-  - resourceClaimTemplate: {name: alpha-train}
-  - resourceClaimTemplate: {name: alpha-eval}
+  - resourceClaimTemplate: {name: vision-train}
+  - resourceClaimTemplate: {name: vision-serve}
 ---
 apiVersion: resource.nvidia.com/v1beta1
 kind: ComputeDomain
-metadata: {name: beta, namespace: ${DEMO_NS}}
+metadata: {name: speech, namespace: ${DEMO_NS}}
 spec:
   channels:
-  - resourceClaimTemplate: {name: beta-train}
+  - resourceClaimTemplate: {name: speech-train}
 EOF
   pause
 
-  step "Pods with 1 or 2 GPUs each, packed onto ${NODE1}, plus one alpha/train pod on ${NODE2}"
+  step "Three jobs share ${NODE1}; vision train also runs on ${NODE2}"
   {
-    workload alpha train 1 "${NODE1}" alpha-train-a
-    workload alpha eval 1 "${NODE1}" alpha-eval-a
-    workload alpha train 1 "${NODE2}" alpha-train-b
+    workload vision train 1 "${NODE1}" vision-train-a
+    workload vision serve 1 "${NODE1}" vision-serve-a
+    workload vision train 1 "${NODE2}" vision-train-b
   } | kubectl apply -f - > /dev/null
-  wait_available -l cd=alpha
-  # beta may also run on NODE2, where it moves in the health scene. Cordoning
-  # NODE2 while it starts makes it start next to alpha on NODE1.
+  wait_available -l cd=vision
+  # speech may also run on NODE2, where it moves in the health scene.
+  # Cordoning NODE2 while it starts makes it start next to vision on NODE1.
   kubectl cordon "${NODE2}" > /dev/null
-  workload beta train 2 "${NODE1},${NODE2}" beta-train | kubectl apply -f - > /dev/null
-  wait_available -l cd=beta || { kubectl uncordon "${NODE2}" > /dev/null; fail "beta did not start"; }
+  workload speech train 2 "${NODE1},${NODE2}" speech-train | kubectl apply -f - > /dev/null
+  wait_available -l cd=speech || { kubectl uncordon "${NODE2}" > /dev/null; fail "speech did not start"; }
   kubectl uncordon "${NODE2}" > /dev/null
-  board
+  show_board
   pause
 
-  step "Inside the pods: each sees only its own channel"
+  step "Each pod sees only its own channel"
   local d
-  for d in alpha-train-a alpha-eval-a beta-train alpha-train-b; do
+  for d in vision-train-a vision-serve-a speech-train vision-train-b; do
     printf '  %s%-14s%s %s\n' "${B}" "${d}" "${R}" "$(kubectl exec -n "${DEMO_NS}" "deploy/${d}" -- ls /dev/nvidia-caps-imex-channels | tr '\n' ' ')"
   done
-  ok "3 isolated channels on one node, 2 ComputeDomains, 4 GPUs fully used"
-  ok "alpha/train has the same channel on both nodes, so its pods talk over NVLink"
+  ok "One node, two ComputeDomains, three private channels"
+  ok "vision train keeps its channel across nodes"
   pause
 }
 
@@ -329,21 +386,21 @@ taint_rules_json() {
 }
 
 scene_health() {
-  banner "3 · GPU health" "A failed GPU evicts only the pod using it; the pod moves, everyone else keeps running"
+  banner "3 · GPU health" "Only the job on the failed GPU moves"
   local api
   api=$(taint_api)
   [[ -n "${api}" ]] || fail "DeviceTaintRule API not found: enable the DRADeviceTaints and DRADeviceTaintRules gates"
 
   local claim pool device
-  claim=$(kubectl get pods -n "${DEMO_NS}" -l app=beta-train -o json |
+  claim=$(kubectl get pods -n "${DEMO_NS}" -l app=speech-train -o json |
     jq -r '.items[0].status.resourceClaimStatuses[] | select(.name == "gpus") | .resourceClaimName')
   read -r pool device < <(kubectl get resourceclaim -n "${DEMO_NS}" "${claim}" -o json |
     jq -r '.status.allocation.devices.results[0] | "\(.pool) \(.device)"')
   local before
-  before=$(kubectl get pods -n "${DEMO_NS}" -l cd=alpha -o jsonpath='{range .items[*]}{.metadata.uid}{"\n"}{end}' | sort)
+  before=$(kubectl get pods -n "${DEMO_NS}" -l cd=vision -o jsonpath='{range .items[*]}{.metadata.uid}{"\n"}{end}' | sort)
 
-  step "${device} on ${pool} reports a fatal XID: taint it NoExecute"
-  show_apply << EOF
+  step "${device} on ${pool} fails with XID 79"
+  show_apply --pause << EOF
 apiVersion: ${api}
 kind: DeviceTaintRule
 metadata: {name: xid-${pool}-${device}, labels: {demo: imex}}
@@ -352,62 +409,65 @@ spec:
   taint: {key: gpu.nvidia.com/xid, value: "79", effect: NoExecute}
 EOF
 
-  # Redraw until beta runs again, on the node with two healthy GPUs free.
+  # Redraw until speech runs again, on the node with two healthy GPUs free.
   local deadline=$((SECONDS + DEMO_TIMEOUT)) node=""
   while ((SECONDS < deadline)); do
-    node=$(kubectl get pods -n "${DEMO_NS}" -l app=beta-train -o json | jq -r '[.items[]
+    node=$(kubectl get pods -n "${DEMO_NS}" -l app=speech-train -o json | jq -r '[.items[]
       | select(.metadata.deletionTimestamp == null and .status.phase == "Running"
                and ([.status.containerStatuses[]?.ready] | all))][0].spec.nodeName // ""')
-    printf '\e[2J\e[H'
-    banner "3 · GPU health" "${device} on ${pool} tainted NoExecute"
-    board
+    if ! panes_on; then
+      printf '\e[2J\e[H'
+      banner "3 · GPU health" "${device} on ${pool} failed"
+      board
+    fi
     [[ -n "${node}" && "${node}" != "${pool}" ]] && break
     sleep 2
   done
-  [[ -n "${node}" && "${node}" != "${pool}" ]] || fail "beta did not move off ${pool}"
-  ok "beta moved to ${node} with 2 healthy GPUs, and got its channel at once from the running daemon"
-  if [[ "$(kubectl get pods -n "${DEMO_NS}" -l cd=alpha -o jsonpath='{range .items[*]}{.metadata.uid}{"\n"}{end}' | sort)" == "${before}" ]]; then
-    ok "every alpha pod kept running untouched"
+  [[ -n "${node}" && "${node}" != "${pool}" ]] || fail "speech did not move off ${pool}"
+  ok "speech moved to ${node}, its channel ready at once"
+  if [[ "$(kubectl get pods -n "${DEMO_NS}" -l cd=vision -o jsonpath='{range .items[*]}{.metadata.uid}{"\n"}{end}' | sort)" == "${before}" ]]; then
+    ok "vision kept running"
   fi
-  note "before reservations a pod took all 4 GPUs of a node, so one bad GPU took the whole node"
+  note "Before: one pod held all 4 GPUs, so one bad GPU took the node"
   pause
 }
 
 scene_upgrade() {
-  banner "4 · Daemon upgrades" "The admin decides when and how fast daemons change: by clique, never node by node"
-  step "Upgrade knobs of the ComputeDomainDaemonSet"
+  banner "4 · Daemon upgrades" "Clique by clique, when the admin decides"
+  step "Upgrade knobs"
   kubectl get computedomaindaemonset default -o json | jq '{image: (.spec.image // "<pinned at creation>"), updateStrategy: .spec.updateStrategy}'
-  note "OnDelete never restarts daemons · RollingUpdate restarts maxUnavailableCliques whole cliques at a time"
-  note "minReadySeconds soaks each batch · paused holds the rollout · topologyKey goes rack block by rack block"
+  note "OnDelete or RollingUpdate · cliques at a time · soak · pause · by domain"
+  pause
+
+  # Restarting the IMEX daemons of a clique breaks the multi-node jobs on it,
+  # so admins move workloads off a clique before its daemons change.
+  step "Drain jobs first: a daemon restart disrupts its clique"
+  run kubectl delete deployments -n "${DEMO_NS}" --all
+  kubectl wait pods -n "${DEMO_NS}" -l demo=imex --for=delete --timeout="${DEMO_TIMEOUT}s" > /dev/null
+  ok "Clique drained"
   pause
 
   local verbosity
   verbosity=$(kubectl get computedomaindaemonset default -o json | jq -r 'if .spec.logVerbosity == 2 then 1 else 2 end')
-  step "Change the daemons (here, their log verbosity) and roll out one clique at a time"
+  step "Roll out new daemon settings, one clique at a time"
   run kubectl patch computedomaindaemonset default --type=merge -p "'{\"spec\": {\"logVerbosity\": ${verbosity}, \"updateStrategy\": {\"type\": \"RollingUpdate\", \"rollingUpdate\": {\"maxUnavailableCliques\": 1, \"minReadySeconds\": 10}}}}'"
   pause
 
-  local before
-  before=$(kubectl get pods -n "${DEMO_NS}" -o jsonpath='{range .items[*]}{.metadata.uid}{"\n"}{end}' | sort)
   local deadline=$((SECONDS + DEMO_ROLLOUT_WATCH)) started=$SECONDS
   while ((SECONDS < deadline)); do
-    printf '\e[2J\e[H'
-    banner "4 · Daemon upgrades" "rolling out, $((SECONDS - started))s"
-    kubectl get computedomaindaemonset default
-    kubectl get computedomaindaemonset default -o json | jq -r '
-      "\n  clique                                    nodes ready updated",
-      (.status.cliques[]? | "  \(.id | .[0:40] | . + (" " * (40 - length)))  \(.nodes)     \(.readyNodes)     \(.updatedNodes)\(if .stalledReason then "  stalled: " + .stalledReason else "" end)")'
-    printf '\n  %sworkloads%s\n' "${B}" "${R}"
-    kubectl get pods -n "${DEMO_NS}" -o custom-columns='  POD:.metadata.labels.app,NODE:.spec.nodeName,STATUS:.status.phase,RESTARTS:.status.containerStatuses[0].restartCount' --no-headers |
-      sed 's/^/  /'
+    if panes_on; then
+      printf '\r  %srolling out, %ds%s' "${D}" "$((SECONDS - started))" "${R}"
+    else
+      printf '\e[2J\e[H'
+      banner "4 · Daemon upgrades" "rolling out, $((SECONDS - started))s"
+      cdds_status
+    fi
     if kubectl get computedomaindaemonset default -o json | jq -e '.status.observedGeneration == .metadata.generation
         and .status.updatedNumberScheduled == .status.desiredNumberScheduled
         and .status.numberReady == .status.desiredNumberScheduled
         and ([.status.conditions[]? | select(.type == "RolloutInProgress" and .status == "True")] | length == 0)' > /dev/null; then
-      ok "every clique runs the new daemons"
-      if [[ "$(kubectl get pods -n "${DEMO_NS}" -o jsonpath='{range .items[*]}{.metadata.uid}{"\n"}{end}' | sort)" == "${before}" ]]; then
-        ok "and every workload pod kept running through it"
-      fi
+      printf '\n'
+      ok "All cliques updated"
       break
     fi
     sleep 3
@@ -415,8 +475,16 @@ scene_upgrade() {
   pause
 }
 
+# cdds_status prints the ComputeDomainDaemonSet and its cliques.
+cdds_status() {
+  kubectl get computedomaindaemonset default
+  kubectl get computedomaindaemonset default -o json | jq -r '
+    "\n  clique                                    nodes ready updated",
+    (.status.cliques[]? | "  \(.id | .[0:40] | . + (" " * (40 - length)))  \(.nodes)     \(.readyNodes)     \(.updatedNodes)\(if .stalledReason then "  stalled: " + .stalledReason else "" end)")'
+}
+
 cleanup() {
-  banner "Cleanup" "Removing the demo workloads"
+  banner "Cleanup" "Removing the demo jobs"
   kubectl delete devicetaintrules -l demo=imex --ignore-not-found > /dev/null 2>&1 || true
   [[ -n "${NODE2:-}" ]] && kubectl uncordon "${NODE2}" > /dev/null 2>&1 || true
   kubectl delete namespace "${DEMO_NS}" --ignore-not-found --timeout="${DEMO_TIMEOUT}s"
@@ -425,10 +493,20 @@ cleanup() {
 
 main() {
   local what="${1:-all}"
+  case "${what}" in
+    tmux) panes_tmux "$0" all; return ;;
+    pane-applied) follow_applied; return ;;
+    pane-pods)
+      refresh "kubectl get pods -n ${DEMO_DRIVER_NS} -o wide"
+      return
+      ;;
+  esac
   preflight
   case "${what}" in
+    pane-board) refresh board ;;
+    pane-objects) refresh objects ;;
     all)
-      banner "ComputeDomains on GB200" "static IMEX daemons + channel reservations · nodes ${NODE1} ${NODE2}"
+      banner "ComputeDomains on GB200" "Static IMEX daemons and channel reservations"
       pause
       scene_static
       scene_channels
@@ -441,7 +519,7 @@ main() {
     upgrade) scene_upgrade ;;
     board) board ;;
     cleanup) cleanup ;;
-    *) sed -n '16,30p' "$0"; exit 1 ;;
+    *) sed -n '16,33p' "$0"; exit 1 ;;
   esac
 }
 
